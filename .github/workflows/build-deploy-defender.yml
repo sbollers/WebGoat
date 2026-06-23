@@ -1,0 +1,76 @@
+name: Build, Push & Defender Scan (Demo)
+
+# DEMO: builds the (deliberately vulnerable) WebGoat container, pushes it to ACR,
+# and scans it with the Microsoft Defender for Cloud CLI so the image + its
+# vulnerabilities flow into Cloud Security Explorer / Attack path analysis.
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  build-push-scan:
+    name: Build, push to ACR, Defender CLI scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+
+      - name: Build WebGoat jar (skip tests)
+        run: |
+          chmod +x mvnw
+          ./mvnw -B -ntp -DskipTests clean package
+
+      - name: Log in to Azure Container Registry
+        run: echo "${{ secrets.ACR_PASSWORD }}" | docker login "${{ secrets.ACR_LOGIN_SERVER }}" -u "${{ secrets.ACR_USERNAME }}" --password-stdin
+
+      - name: Build and push WebGoat image to ACR
+        run: |
+          IMAGE="${{ secrets.ACR_LOGIN_SERVER }}/webgoat:${{ github.sha }}"
+          docker build -t "$IMAGE" -t "${{ secrets.ACR_LOGIN_SERVER }}/webgoat:latest" .
+          docker push "$IMAGE"
+          docker push "${{ secrets.ACR_LOGIN_SERVER }}/webgoat:latest"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      - name: Download Defender for Cloud CLI
+        run: |
+          curl -L -o defender "https://aka.ms/defender-cli_linux-x64" && chmod +x defender
+
+      - name: Defender for Cloud CLI image scan (publishes to Defender for Cloud)
+        run: ./defender scan image "$IMAGE"
+        continue-on-error: true
+        env:
+          DEFENDER_TENANT_ID: ${{ secrets.DEFENDER_CICD_TENANT_ID }}
+          DEFENDER_CLIENT_ID: ${{ secrets.DEFENDER_CICD_CLIENT_ID }}
+          DEFENDER_CLIENT_SECRET: ${{ secrets.DEFENDER_CICD_CLIENT_SECRET }}
+
+  msdo:
+    name: Microsoft Security DevOps (code, deps, IaC, secrets)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Microsoft Security DevOps
+        uses: microsoft/security-devops-action@v1
+        id: msdo
+        with:
+          categories: 'IaC,secrets,code,artifacts'
+      - name: Upload results to Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: ${{ steps.msdo.outputs.sarifFile }}
+          category: msdo-webgoat
